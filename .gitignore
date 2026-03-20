@@ -1,0 +1,7 @@
+__pycache__/
+.vscode/
+*.avi
+*.pyc
+*.ipynb
+*.csv
+*.json
