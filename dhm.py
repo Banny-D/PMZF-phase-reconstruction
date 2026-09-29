@@ -14,10 +14,20 @@ if globals.USE_UNET_MASK:
         print('unet loading failed')
         globals.USE_UNET_MASK = False
 
+try:
+    import cupy as cp
+    _cupy_available = True
+except Exception:
+    cp = None
+    _cupy_available = False
+
 class dhmPic:
-    def __init__(self, rawdata):
+    def __init__(self, rawdata=None):
         self.rawdata = rawdata
-        self.m, self.n = rawdata.shape
+        if rawdata is not None:
+            self.m, self.n = rawdata.shape
+        else:
+            self.m, self.n = 0, 0
         self.angle = None
         self.phase = None
         self.FMZF_phase = None
@@ -33,6 +43,8 @@ class dhmPic:
         # this method is based on Least Square Estimate
         # step 1: construct periodic psai
         M, N = ph_wrap.shape
+        if M < 2 or N < 2:
+            raise ValueError("Phase unwrapping requires at least 2 rows and 2 columns.")
         ph1 = np.zeros((M+2, N+2))
         ph1[1:M+1, 1:N+1] = ph_wrap
 
@@ -117,6 +129,115 @@ class dhmPic:
 
         return phase
 
+    def dhm_unwrap_gpu(self, ph_wrap, return_numpy=True, use_float64=True):
+        """
+        GPU-accelerated version of dhm_unwrap().
+        The mathematical logic is kept the same as the original function.
+
+        Args:
+            ph_wrap: wrapped phase, numpy array
+            return_numpy: whether to convert result back to numpy
+            use_float64: use float64 for better numerical consistency
+                         with the original numpy version
+
+        Returns:
+            phase: unwrapped phase
+        """
+
+        if not _cupy_available:
+            print("CuPy is not available, falling back to CPU dhm_unwrap().")
+            return self.dhm_unwrap(ph_wrap)
+
+        dtype = cp.float64 if use_float64 else cp.float32
+        ph = cp.asarray(ph_wrap, dtype=dtype)
+
+        M, N = ph.shape
+        if M < 2 or N < 2:
+            raise ValueError("Phase unwrapping requires at least 2 rows and 2 columns.")
+
+        # =========================
+        # step 1: construct periodic psai
+        # =========================
+        ph1 = cp.zeros((M + 2, N + 2), dtype=dtype)
+        ph1[1:M+1, 1:N+1] = ph
+
+        ph1[0, :]     = ph1[2, :]
+        ph1[M + 1, :] = ph1[M, :]
+        ph1[1:M+1, 0]     = ph1[1:M+1, 2]
+        ph1[1:M+1, N + 1] = ph1[1:M+1, N]
+
+        # =========================
+        # step 2: construct delta_v and delta_h
+        # =========================
+        delta_v = ph1[1:, 1:N+1] - ph1[:-1, 1:N+1]     # shape: (M+1, N)
+        delta_v = _wrap_to_pi_gpu(delta_v)
+
+        delta_h = ph1[1:M+1, 1:] - ph1[1:M+1, :-1]     # shape: (M, N+1)
+        delta_h = _wrap_to_pi_gpu(delta_h)
+
+        # =========================
+        # step 3: construct rou
+        # =========================
+        rou = delta_v[1:, :] - delta_v[:-1, :] + delta_h[:, 1:] - delta_h[:, :-1]
+
+        # =========================
+        # step 4: FFT
+        # =========================
+        rou1 = cp.zeros((M, 2 * N - 2), dtype=dtype)
+        rou1[:, :N] = rou
+        if N > 1:
+            # original loop:
+            # for n in range(N, 2*N-2):
+            #     rou1[m, n] = rou[m, 2*N-2-n]
+            rou1[:, N:] = rou[:, 1:N-1][:, ::-1]
+
+        sp = cp.fft.fft(rou1, axis=1)
+        sp1 = cp.real(sp[:, :N])
+
+        sp2 = cp.zeros((2 * M - 2, N), dtype=dtype)
+        sp2[:M, :] = sp1
+        if M > 1:
+            # original loop:
+            # for m in range(M, 2*M-2):
+            #     sp2[m, n] = sp1[2*M-2-m, n]
+            sp2[M:, :] = sp1[1:M-1, :][::-1, :]
+
+        sp = cp.fft.fft(sp2, axis=0)
+        sp1 = cp.real(sp[:M, :])
+
+        # =========================
+        # step 5: construct capital psai
+        # =========================
+        mm = cp.arange(M, dtype=dtype)[:, None]
+        nn = cp.arange(N, dtype=dtype)[None, :]
+        denom = 2 * cp.cos(cp.pi * mm / (M - 1)) + 2 * cp.cos(cp.pi * nn / (N - 1)) - 4
+
+        psai = cp.zeros((M, N), dtype=dtype)
+        valid = cp.ones((M, N), dtype=cp.bool_)
+        valid[0, 0] = False
+        psai[valid] = sp1[valid] / denom[valid]
+
+        # =========================
+        # step 6: inverse FFT according to step2
+        # =========================
+        rou1 = cp.zeros((M, 2 * N - 2), dtype=dtype)
+        rou1[:, :N] = psai
+        if N > 1:
+            rou1[:, N:] = psai[:, 1:N-1][:, ::-1]
+
+        sp = cp.fft.ifft(rou1, axis=1)
+        sp1 = cp.real(sp[:, :N])
+
+        sp2 = cp.zeros((2 * M - 2, N), dtype=dtype)
+        sp2[:M, :] = sp1
+        if M > 1:
+            sp2[M:, :] = sp1[1:M-1, :][::-1, :]
+
+        sp = cp.fft.ifft(sp2, axis=0)
+        phase = cp.real(sp[:M, :])
+
+        return cp.asnumpy(phase) if return_numpy else phase
+
     # Identify the center point of the binary image
     def find_left_center(self):
         binary_img = self.img_thresh
@@ -182,7 +303,7 @@ class dhmPic:
     
     # Phase unwrapping
     def get_phase(self):
-        self.phase = self.dhm_unwrap(self.angle) * -1
+        self.phase = self.dhm_unwrap_gpu(self.angle) * -1
         return self.phase
 
     # Unet recognizes background area
@@ -264,147 +385,6 @@ def result_remap(matrix, trans_value, scale_value):
     out_matrix = out_matrix.astype(np.uint8)
     return out_matrix
 
-def dhm_angle2phase(filename):
-    if filename is None:
-        filename = input('Enter video filename:')
-    try:
-        angle = np.fromfile(filename, dtype=np.uint8)
-        angle = cv2.imdecode(angle, cv2.IMREAD_GRAYSCALE)  # Read as grayscale image
-    except Exception as e:
-        print(f'Unable to open file: {e}')
-        return
-    if angle is None:
-        print('Unable to open file')
-        return
-    raw = np.ones_like(angle)  # RGB three channels
-    angle = np.interp(angle, (np.min(angle), np.max(angle)), (-np.pi, np.pi))
-    pic = dhmPic(raw)
-    pic.angle = angle
-    phase = pic.get_phase()
-    phase = cv2.normalize(pic.phase, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
-    phase = cv2.cvtColor(phase, cv2.COLOR_GRAY2BGR)
-    # Display grayscale image
-    cv2.imshow('phase', phase)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-
-# ===================== Accelerated Helpers & dhm_video =====================
-# Multi-process + optional GPU (CuPy) acceleration for per-frame processing.
-# Keeps the same interface as before.
-import multiprocessing as mp
-from functools import partial
-
-# Optional GPU backend
-try:
-    import cupy as cp
-    _cupy_available = True
-except Exception:
-    cp = None
-    _cupy_available = False
-
-# Optional fast unwrap (skimage)
-try:
-    from skimage.restoration import unwrap_phase as _unwrap_fast
-    _unwrap_fast_available = True
-except Exception:
-    _unwrap_fast_available = False
-
-def _unwrap_phase_np(angle_np):
-    """
-    Fast phase unwrapping with skimage if available; otherwise
-    falls back to original least-squares unwrapping method.
-    """
-    if _unwrap_fast_available:
-        return _unwrap_fast(angle_np).astype(angle_np.dtype) * -1  # preserve previous sign
-    # Fall back to the original method in this module
-    pic_stub = dhmPic(np.zeros_like(angle_np, dtype=np.float32))
-    pic_stub.angle = angle_np
-    return pic_stub.dhm_unwrap(angle_np) * -1
-
-def _compute_angle_fft(frame_gray, cx, cy, radi, scale=5, use_gpu=False):
-    """
-    Compute angle via frequency windowing + IFFT.
-    Uses CuPy GPU if available and use_gpu=True, else NumPy.
-    """
-    xp = cp if (use_gpu and _cupy_available) else np
-    # convert to array on target device
-    arr = xp.asarray(frame_gray, dtype=xp.float32)
-    M, N = arr.shape
-    # FFT and shift
-    dft = xp.fft.fft2(arr)
-    dftshift = xp.fft.fftshift(dft)
-
-    # determine filtered spectrum size
-    filt_h = M // scale
-    filt_w = N // scale
-    if filt_h < 2 * radi + 1 or filt_w < 2 * radi + 1:
-        filt_h, filt_w = M, N
-
-    filtered = xp.zeros((filt_h, filt_w), dtype=xp.complex64)
-    h2, w2 = filt_h // 2, filt_w // 2
-    r = radi
-
-    # crop from the original spectrum and paste to the center
-    patch = dftshift[cy - r: cy + r, cx - r: cx + r]
-    filtered[h2 - r:h2 + r, w2 - r:w2 + r] = patch
-
-    # IFFT back to spatial domain
-    filtered_shift = xp.fft.ifftshift(filtered)
-    spatial = xp.fft.ifft2(filtered_shift)
-
-    # angle
-    angle = xp.angle(spatial).astype(xp.float32)
-
-    # bring back to CPU (numpy)
-    return cp.asnumpy(angle) if xp is cp else angle
-
-def _zernike_fit(phase_np, mask_np=None, zn=2):
-    """
-    Zernike fitting with optional mask (numpy arrays).
-    Mirrors logic in dhmPic.fitting, returns (FMZF_phase, PMZF_phase)
-    depending on whether mask is None or not.
-    """
-    # Prepare image and mask
-    img_phase = phase_np.astype(float).copy()
-    L, K = img_phase.shape
-
-    if mask_np is not None:
-        if mask_np.shape != img_phase.shape:
-            mask_np = cv2.resize(mask_np, (K, L))
-        if mask_np.dtype != bool:
-            mask_np = cv2.threshold(mask_np, 140, 255, cv2.THRESH_BINARY)[1]
-        img_phase[mask_np == 0] = np.nan
-
-    cart = RZern(zn)
-    ddx = np.linspace(-1.0, 1.0, K)
-    ddy = np.linspace(-1.0, 1.0, L)
-    xv, yv = np.meshgrid(ddx, ddy)
-    cart.make_cart_grid(xv, yv, unit_circle=False)
-    c1 = cart.fit_cart_grid(img_phase)[0]
-    Phi = cart.eval_grid(c1, matrix=True)
-    phase_fitted = phase_np - Phi
-
-    if np.max(phase_fitted) < 0:
-        phase_fitted = -phase_fitted
-
-    return phase_fitted
-
-def _maybe_unet_mask(phase_np):
-    """
-    Create mask using existing Unet (if enabled).
-    """
-    if not getattr(globals, "USE_UNET_MASK", False):
-        return None
-    try:
-        # reuse loaded "unet" from module scope if available
-        phase_u8 = cv2.normalize(phase_np, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
-        image = Image.fromarray(phase_u8).convert('L')
-        mask = unet.detect_image(image, count=False, name_classes=["background","object"])
-        return mask
-    except Exception as e:
-        print("UNet mask failed:", e)
-        return None
-
 def ensure_bgr(frame, w, h):
     """Ensure output is uint8 (h,w,3) BGR"""
     if frame is None:
@@ -420,6 +400,16 @@ def ensure_bgr(frame, w, h):
         frame = np.zeros((h, w, 3), dtype=np.uint8)
     return frame
 
+def _wrap_to_pi_gpu(x):
+    """
+    Keep exactly the same wrap logic as the original code:
+        if x <= -pi: x += 2*pi
+        if x >  pi:  x -= 2*pi
+    """
+    x = cp.where(x <= -cp.pi, x + 2 * cp.pi, x)
+    x = cp.where(x >  cp.pi, x - 2 * cp.pi, x)
+    return x
+
 if __name__ == '__main__':
     # Load wrapped phase from sample/phase_wrap.csv
     phase_wrap = np.loadtxt('sample/phase_wrap.csv', delimiter=',')
@@ -427,7 +417,7 @@ if __name__ == '__main__':
     pic = dhmPic()
     pic.angle = phase_wrap
     # Unwrap the phase
-    phase = pic.dhm_unwrap(phase_wrap)
+    phase = pic.dhm_unwrap_gpu(phase_wrap)
     
     # Save unwrapped phase to phase.csv
     np.savetxt('sample/phase.csv', phase, delimiter=',')
