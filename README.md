@@ -2,6 +2,18 @@
 
 This repository contains the core code for digital holographic microscopy (DHM)-based phase reconstruction and Zernike-fitting-based phase correction used in our paper.
 
+## Related Paper
+
+**[Real-Time Holography Guided 3D Printing for Photocurable Hydrogel Microstructures With Tailored Morphology and Stiffness](https://doi.org/10.1109/TMECH.2026.3694211)**
+
+Xinyi Dong, Yanfeng Zhao, Kaijun Lin, Haotian Yang, Yaozhen Hou, Qing Shi, Qiang Huang, Toshio Fukuda, and Huaping Wang.
+
+*IEEE/ASME Transactions on Mechatronics*, 2026. DOI: [10.1109/TMECH.2026.3694211](https://doi.org/10.1109/TMECH.2026.3694211).
+
+The paper integrates DHM with digital light processing (DLP) to provide real-time feedback for printing photocurable hydrogel microstructures with controlled morphology and stiffness. Its partial matrix Zernike fitting (PMZF) method estimates optical phase distortion using only background pixels identified by U-Net segmentation. Compared with full matrix Zernike fitting (FMZF), which includes object pixels, PMZF reduces the influence of the object's phase on background distortion estimation. The paper reports phase reconstruction at 5 frames per second in the experimental system.
+
+This repository provides the phase reconstruction and correction components of that workflow, including phase unwrapping, PMZF/FMZF comparison, and U-Net training. The wrapped-phase demo corresponds to the phase correction workflow described in Section II-B and Fig. 2 of the paper.
+
 ## Overview
 
 The main script is `dhm.py`, which implements the DHM processing pipeline.
@@ -53,8 +65,17 @@ python train.py
 - The provided demo starts from a wrapped phase image rather than the raw hologram.
 - Additional local path configuration may be required before running the code.
 
-<!-- 
 ## Citation
 
-If you use this code or dataset in your research, please cite our paper [*"Real-Time Holography Guided 3D Printing for Photocurable Hydrogel Microstructures with Tailored Mechanical and Morphological Properties"*](https://example.com). 
--->
+If you use this code or dataset in your research, please cite the following paper:
+
+```bibtex
+@article{dong2026realtime,
+  author  = {Dong, Xinyi and Zhao, Yanfeng and Lin, Kaijun and Yang, Haotian and Hou, Yaozhen and Shi, Qing and Huang, Qiang and Fukuda, Toshio and Wang, Huaping},
+  title   = {Real-Time Holography Guided {3D} Printing for Photocurable Hydrogel Microstructures With Tailored Morphology and Stiffness},
+  journal = {IEEE/ASME Transactions on Mechatronics},
+  year    = {2026},
+  doi     = {10.1109/TMECH.2026.3694211},
+  url     = {https://doi.org/10.1109/TMECH.2026.3694211}
+}
+```
